@@ -1,0 +1,242 @@
+# HASH TIME-LOCKED CONTRACT (HTLC) NOTE
+# =================================================================================================
+#
+# The note holds one fungible asset. It can be consumed by ANY account that exposes the standard
+# BasicWallet `create_note` procedure, in one of two ways:
+#
+# - Claim (note args are not empty): the note args are an advice map key. The advice map value
+#   under that key is a 32-byte preimage as 8 big-endian u32 limbs. The script checks that
+#   sha256(preimage) equals the hashlock. It then creates a public P2ID note for the recipient,
+#   moves the asset into it, attaches the preimage, and seals that note. A claim is possible at any
+#   block, also after expiry.
+#
+# - Refund (note args are empty): possible only when the reference block is at or after the expiry
+#   block. The script creates a public P2ID note for the refund account, moves the asset into it,
+#   and seals that note.
+#
+# The assets never enter the consuming account's vault, so the consumer cannot keep them. The
+# consumer only pays the transaction fee.
+
+use miden::core::crypto::hashes::sha256
+use miden::core::sys
+use miden::core::word
+use miden::protocol::active_note
+use miden::protocol::asset
+use miden::protocol::output_note
+use miden::protocol::tx
+use {NOTE_TYPE_PUBLIC} from miden::protocol::note
+use miden::standards::note::note_tag
+use miden::standards::notes::p2id
+
+# ERRORS
+# =================================================================================================
+
+const ERR_HTLC_WRONG_NUMBER_OF_STORAGE_ITEMS="HTLC note expects exactly 13 note storage items"
+
+const ERR_HTLC_WRONG_PREIMAGE="HTLC preimage does not hash to the hashlock"
+
+const ERR_HTLC_NOT_EXPIRED="HTLC refund is possible only from the expiry block on"
+
+const ERR_HTLC_WRONG_NUMBER_OF_ASSETS="HTLC note must hold exactly one asset"
+
+const ERR_HTLC_ASSET_ALTERED="HTLC note asset differs from the asset the note was created with"
+
+# CONSTANTS
+# =================================================================================================
+
+# Note storage layout (13 items, written to memory from address 0):
+# [0..8)  hashlock: SHA-256 digest of the preimage as 8 big-endian u32 limbs
+# 8, 9    recipient account ID suffix, prefix
+# 10, 11  refund account ID suffix, prefix
+# 12      expiry block number
+const NUM_STORAGE_ITEMS=13
+const STORAGE_PTR=0
+const HASHLOCK_LO_PTR=0
+const HASHLOCK_HI_PTR=4
+const RECIPIENT_SUFFIX_PTR=8
+const RECIPIENT_PREFIX_PTR=9
+const REFUND_SUFFIX_PTR=10
+const REFUND_PREFIX_PTR=11
+const EXPIRY_PTR=12
+
+# `get_bounded_storage` pads its write to a multiple of 8 felts, so the storage uses 0..16.
+const PREIMAGE_PTR=16
+const PREIMAGE_HI_PTR=20
+const PREIMAGE_NUM_WORDS=2
+
+# The attachment scheme that marks the revealed preimage on the payout note.
+const HTLC_PREIMAGE_ATTACHMENT_SCHEME=1000
+
+# The payout note serial number is the HTLC note serial number with element 0 increased by this
+# offset. The two paths use different offsets, so their payout notes never share an ID.
+const CLAIM_SERIAL_OFFSET=1
+const REFUND_SERIAL_OFFSET=2
+
+# HELPER PROCEDURES
+# =================================================================================================
+
+#! Removes the note's single asset and returns it.
+#!
+#! The remaining asset must equal the asset the note was created with. This prevents a consumer
+#! from removing part of the asset before the script runs.
+#!
+#! Inputs:  []
+#! Outputs: [ASSET_ID, ASSET_VALUE]
+#!
+#! Panics if:
+#! - the note does not hold exactly one asset.
+#! - the remaining asset differs from the initial asset.
+@locals(16)
+proc load_escrowed_asset
+    locaddr.0 exec.active_note::remove_all_assets
+    # => [num_assets]
+
+    eq.1 assert.err=ERR_HTLC_WRONG_NUMBER_OF_ASSETS
+    # => []
+
+    locaddr.8 exec.active_note::get_initial_assets
+    # => [num_initial_assets]
+
+    eq.1 assert.err=ERR_HTLC_ASSET_ALTERED
+    # => []
+
+    locaddr.0 exec.asset::load
+    # => [ASSET_ID, ASSET_VALUE]
+
+    locaddr.8 exec.asset::load
+    # => [INITIAL_ASSET_ID, INITIAL_ASSET_VALUE, ASSET_ID, ASSET_VALUE]
+
+    movupw.2 assert_eqw.err=ERR_HTLC_ASSET_ALTERED
+    assert_eqw.err=ERR_HTLC_ASSET_ALTERED
+    # => []
+
+    locaddr.0 exec.asset::load
+    # => [ASSET_ID, ASSET_VALUE]
+end
+
+#! Creates a public P2ID note for the target account, moves the escrowed asset into it, and
+#! returns its index. The note is not sealed yet.
+#!
+#! Inputs:  [target_suffix, target_prefix, serial_offset]
+#! Outputs: [note_idx]
+proc create_payout_note
+    exec.active_note::get_serial_number
+    # => [S0, S1, S2, S3, target_suffix, target_prefix, serial_offset]
+
+    movup.6 add
+    # => [SERIAL_NUM, target_suffix, target_prefix]
+
+    push.NOTE_TYPE_PUBLIC
+    # => [note_type, SERIAL_NUM, target_suffix, target_prefix]
+
+    dup.6 exec.note_tag::create_account_target
+    # => [tag, note_type, SERIAL_NUM, target_suffix, target_prefix]
+
+    movup.7 movup.7
+    # => [target_suffix, target_prefix, tag, note_type, SERIAL_NUM]
+
+    exec.p2id::create_output_note
+    # => [note_idx]
+
+    dup exec.load_escrowed_asset
+    # => [ASSET_ID, ASSET_VALUE, note_idx, note_idx]
+
+    exec.output_note::add_asset
+    # => [note_idx]
+end
+
+#! Claim path: checks the preimage, pays the recipient, and publishes the preimage.
+#!
+#! Inputs:  [PREIMAGE_KEY]
+#! Outputs: []
+#!
+#! Panics if:
+#! - the advice map has no value under PREIMAGE_KEY.
+#! - the preimage limbs are not u32 values.
+#! - sha256(preimage) differs from the hashlock.
+proc claim
+    adv.push_mapval dropw
+    # => []  advice stack: [P0, P1, ..., P7]
+
+    padw adv_loadw padw adv_loadw swapw
+    # => [P0, P1, P2, P3, P4, P5, P6, P7]
+
+    mem_storew_le.PREIMAGE_PTR swapw
+    mem_storew_le.PREIMAGE_HI_PTR swapw
+    # => [P0, ..., P7]
+
+    exec.sha256::hash
+    # => [D0, ..., D7]
+
+    padw mem_loadw_le.HASHLOCK_HI_PTR padw mem_loadw_le.HASHLOCK_LO_PTR
+    # => [H0, H1, H2, H3, H4, H5, H6, H7, D0, ..., D7]
+
+    movupw.2 assert_eqw.err=ERR_HTLC_WRONG_PREIMAGE
+    assert_eqw.err=ERR_HTLC_WRONG_PREIMAGE
+    # => []
+
+    push.CLAIM_SERIAL_OFFSET mem_load.RECIPIENT_PREFIX_PTR mem_load.RECIPIENT_SUFFIX_PTR
+    # => [recipient_suffix, recipient_prefix, serial_offset]
+
+    exec.create_payout_note
+    # => [note_idx]
+
+    dup push.PREIMAGE_PTR push.PREIMAGE_NUM_WORDS push.HTLC_PREIMAGE_ATTACHMENT_SCHEME
+    # => [scheme, num_words, preimage_ptr, note_idx, note_idx]
+
+    exec.output_note::add_attachment_from_memory
+    # => [note_idx]
+
+    exec.output_note::seal
+    # => []
+end
+
+#! Refund path: pays the refund account once the expiry block is reached.
+#!
+#! Inputs:  []
+#! Outputs: []
+#!
+#! Panics if:
+#! - the reference block is before the expiry block.
+proc refund
+    mem_load.EXPIRY_PTR exec.tx::get_reference_block_number
+    # => [ref_block, expiry]
+
+    lte assert.err=ERR_HTLC_NOT_EXPIRED
+    # => []
+
+    push.REFUND_SERIAL_OFFSET mem_load.REFUND_PREFIX_PTR mem_load.REFUND_SUFFIX_PTR
+    # => [refund_suffix, refund_prefix, serial_offset]
+
+    exec.create_payout_note
+    # => [note_idx]
+
+    exec.output_note::seal
+    # => []
+end
+
+# NOTE SCRIPT
+# =================================================================================================
+
+#! Inputs:  [NOTE_ARGS, pad(12)]
+#! Outputs: [pad(16)]
+@note_script
+pub proc main
+    push.NUM_STORAGE_ITEMS push.STORAGE_PTR exec.active_note::get_bounded_storage
+    # => [num_storage_items, NOTE_ARGS, pad(12)]
+
+    eq.NUM_STORAGE_ITEMS assert.err=ERR_HTLC_WRONG_NUMBER_OF_STORAGE_ITEMS
+    # => [NOTE_ARGS, pad(12)]
+
+    exec.word::testz
+    # => [is_empty, NOTE_ARGS, pad(12)]
+
+    if.true
+        dropw exec.refund
+    else
+        exec.claim
+    end
+
+    exec.sys::truncate_stack
+    # => [pad(16)]
+end

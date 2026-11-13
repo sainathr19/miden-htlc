@@ -1,0 +1,29 @@
+[package]
+name = "miden-htlc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "A hash time-locked contract (HTLC) note for the Miden rollup"
+license = "MIT"
+publish = false
+
+[dependencies]
+miden-client = "0.18"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
+miden-client = { version = "0.18", features = ["tonic"] }
+miden-client-sqlite-store = "0.18"
+miden-testing = "0.18"
+rand = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
